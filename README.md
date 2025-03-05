@@ -8,7 +8,7 @@ This PoC aims to assess the complexity and feasibility of implementing a Pulsar 
 - **Acepptable Throughput**: Even with limited parallel task processing, we shouldn't have to wait for all tasks to complete before processing new ones. The mechanism used should allow handling new tasks as soon as one finishes.
 - **Long-Running Execution**: The consumer should run indefinitely.
 
-> This PoC was not designed with observability, error handling, extensibility, or idiomatic Rust best practices in mind. The focus is solely on the concepts above.
+> This PoC was not designed with observability, error handling, extensibility, or idiomatic Rust best practices in mind. The focus is only on the properties above.
 
 ### Setup
 
@@ -20,7 +20,7 @@ To run the PoC:
 
 > You can uncomment `tokio-debug-console` to enable debugging with tokio-debug-console: `RUSTFLAGS="--cfg tokio_unstable" cargo run --bin consumer`
 
-The following variables (with default values) control consumer batching and throttling:
+The following variables (with default values) control consumer batching policy and throttling:
 ```rust
     const BATCH_SIZE: usize = 10000;
     const TIMEOUT_MS: Duration = Duration::from_millis(2000);
@@ -46,4 +46,15 @@ The following variables (with default values) control consumer batching and thro
 
 ### Conclusion
 
+The throttling mechanism is based on the synchronous `Semaphore` package, as described in its documentation:
+
+- [limit the number of incoming request being handled at the same time](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html#limit-the-number-of-incoming-requests-being-handled-at-the-same-time)
+
+The timing measurements inside the core are fairly naive, but they provide a reasonable way to evaluate the overall system, including consumer reading and acknowledgement. By adjusting the `MAX_CONCURRENT_THREADS` variable, we can observe throughput changes.
+
+It's also important to note that we simulate some I/O work using `tokio::time::sleep(100ms)` and CPU work with `std::thread::sleep(10ms)` that slightly blocks the Tokio worker pool(not all of them).
+
+This implementation could be further improved by adding extensibility and observability. However, the initial performance results are quite acceptable as a starting point for a Pulsar Rust consumer, especially for workloads that mix I/O and lightly CPU-bound tasks.
+
+If your CPU workload is too high, you might consider using a Rayon worker pool for CPU-bound tasks alongside Tokio. Here’s a good article on the topic: https://ryhl.io/blog/async-what-is-blocking/#the-rayon-crate
 
