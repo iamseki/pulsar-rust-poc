@@ -27,6 +27,18 @@ The following variables (with default values) control consumer batching policy a
     const MAX_CONCURRENT_THREADS: usize = 100;
 ```
 
+### Conclusion
+
+The throttling mechanism is based on the synchronous `Semaphore` package, as described in its documentation:
+
+- [limit the number of incoming request being handled at the same time](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html#limit-the-number-of-incoming-requests-being-handled-at-the-same-time)
+
+The timing measurements inside the core are fairly naive, but they provide a reasonable way to evaluate the overall system, including consumer reading and acknowledgement. By adjusting the `MAX_CONCURRENT_THREADS` variable, we can observe throughput changes.
+
+It's also important to note that we simulate some I/O work using `tokio::time::sleep(100ms)` and CPU work with `std::thread::sleep(10ms)` that slightly blocks the Tokio worker pool(not all of them). 
+
+I ran the setup multiple times, and the avg results were around 1 to 1.5 ms per task:
+
 ```sh
 === System Info ===:
     OS: "Linux 22.04 Ubuntu"
@@ -43,16 +55,6 @@ The following variables (with default values) control consumer batching policy a
 - 11.399093167s total, 1.139909ms avg per iteration for tasks_processed 10000
 - 7.70495259s total, 1.54099ms avg per iteration for tasks_processed 5000
 ```
-
-### Conclusion
-
-The throttling mechanism is based on the synchronous `Semaphore` package, as described in its documentation:
-
-- [limit the number of incoming request being handled at the same time](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html#limit-the-number-of-incoming-requests-being-handled-at-the-same-time)
-
-The timing measurements inside the core are fairly naive, but they provide a reasonable way to evaluate the overall system, including consumer reading and acknowledgement. By adjusting the `MAX_CONCURRENT_THREADS` variable, we can observe throughput changes.
-
-It's also important to note that we simulate some I/O work using `tokio::time::sleep(100ms)` and CPU work with `std::thread::sleep(10ms)` that slightly blocks the Tokio worker pool(not all of them).
 
 This implementation could be further improved by adding extensibility and observability. However, the initial performance results are quite acceptable as a starting point for a Pulsar Rust consumer, especially for workloads that mix I/O and lightly CPU-bound tasks.
 
