@@ -1,23 +1,25 @@
 use std::{
+    error::Error,
     sync::Arc,
+    thread::sleep,
     time::{Duration, Instant},
 };
 
-//#[cfg "tokio-debug-console")]
+//tokio-debug-console
 //use console_subscriber;
 
 use chrono::Local;
-use futures::{future, TryStreamExt, stream::{ FuturesUnordered }};
+use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use pulsar::{message::proto::command_subscribe::SubType, Consumer, Pulsar, TokioExecutor};
 use pulsar_rust_poc::TestData;
 use tokio::{
     process::Command,
     runtime::Handle,
     sync::{Mutex, Semaphore},
-    time::{sleep, timeout},
+    time::{sleep as sleep_tokio, timeout},
 };
 
-use sysinfo::System; // Import system info
+use sysinfo::System;
 
 /// print system info before start benchmarking
 async fn print_system_info() {
@@ -58,21 +60,17 @@ async fn print_system_info() {
     );
 }
 
-/// This example is a Pulsar consumer that should have the following properties:
+/// This example demonstrates a Pulsar consumer with the following properties:
 ///
-/// **Not unbounded processing work:** Which means we have to be able to control how much work is done in parallel by the Tokio runtime.
+/// **Bounded processing:** The Tokio runtime must control the level of parallelism to prevent unbounded work.
 ///
-/// **Batching processing:** Which means that we can pick N messages and processing them at a time including be able to ack or nack the messages.
+/// **Batch processing:** The consumer should process N messages at a time with a timeout configuration, allowing for batch acknowledgment (ack) or negative acknowledgment (nack).
 ///
-/// Non function requirements are:
-///
-/// - Acceptable thorughput not only the processing part but also the ack/nack part as well
-/// - Efficient memory usage
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_system_info().await;
 
-    // #[cfg(feature = "tokio-debug-console")]
+    // tokio-debug-console
     // console_subscriber::init();
 
     let addr = "pulsar://127.0.0.1:6650";
@@ -88,11 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // Wrap the consumer in an Arc<Mutex> to share across tasks
     let consumer = Arc::new(Mutex::new(consumer));
-
+    
     const BATCH_SIZE: usize = 10000;
     const TIMEOUT_MS: Duration = Duration::from_millis(2000);
+    const MAX_CONCURRENT_THREADS: usize = 100;
+
     let mut batch = Vec::with_capacity(BATCH_SIZE);
 
     loop {
@@ -109,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("nothing to poll");
                     }
                     Err(e) => {
-                        eprintln!("Error consuming message: {:?}", e);
+                        eprintln!("Error consuming message: {:?}, retrying later...", e);
                         break;
                     }
                 }
@@ -119,9 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("processing batch len: {}", batch.len());
 
-        let semaphore = Arc::new(Semaphore::new(100));
-        let mut tasks = Vec::with_capacity(BATCH_SIZE);
-        //let mut tasks = FuturesUnordered::new();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_THREADS));
+        //let mut tasks = Vec::with_capacity(BATCH_SIZE);
+        let mut tasks = FuturesUnordered::new();
 
         let mut tasks_processed = 0;
 
@@ -132,30 +131,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let consumer = consumer.clone();
 
             tasks.push(tokio::spawn(async move {
-                let data = msg.deserialize();
-                match data {
-                    Ok(m) => println!(
-                        "processing data: {:?}, timestamp: {:?}",
-                        m,
-                        Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-                    ),
-                    Err(_) => println!("error deserializing"),
-                }
+                let data = match msg.deserialize() {
+                    Ok(data) => data,
+                    Err(e) => {
+                        consumer.lock().await.nack(&msg).await?;
+                        return Err(Box::<dyn Error + Send + Sync>::from(format!("Deserialization failed: {}", e)));
+                    }
+                };
+                println!(
+                    "processing data: {:?}, timestamp: {:?}",
+                    data,
+                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                );
 
-                sleep(Duration::from_millis(200)).await;
+                // All the algorithm needs to do is:
+                // 1. Fetch dependent Data (mostly I/O)
+                // 2. Calculate Operations (CPU)
+                // 3. Calculate KPIs (CPU)
+                // 4. Write it into the database (mostly I/O)
+
+                // Simulate some I/O work
+                sleep_tokio(Duration::from_millis(100)).await;
+
+                // Simulate some CPU work
+                sleep(Duration::from_millis(10));
 
                 let mut consumer = consumer.lock().await;
 
-                match consumer.ack(&msg).await {
-                    Ok(_) => println!("Consumed successfully"),
-                    Err(ack_err) => println!("Error: {:?}", ack_err),
-                }
+                consumer
+                    .ack(&msg)
+                    .await
+                    .map_err(|e| format!("ack failed: {}", e))?;
+                println!("Consumed successfully");
 
                 drop(permit);
+                Ok(())
             }));
         }
 
-        future::join_all(tasks).await;
+        // future::join_all(tasks).await;
+        while let Some(result) = tasks.next().await {
+            match result {
+                Ok(Ok(())) => {}                                   // Successfully processed message
+                Ok(Err(err)) => eprintln!("Task failed: {}", err), // Custom error message
+                Err(join_err) => eprintln!("Task panicked: {:?}", join_err), // Panic case
+            }
+        }
 
         let elapsed = before.elapsed();
         if tasks_processed == 0 {
