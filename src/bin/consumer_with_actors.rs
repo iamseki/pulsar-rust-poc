@@ -73,24 +73,24 @@ async fn print_system_info() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_system_info().await;
 
-    enum Command {
+    enum ExecutorCommand {
         Process { msg: Message<TestData> },
+    }
+
+    enum AckerCommand {
         Ack { msg: Message<TestData> },
         Nack { msg: Message<TestData> },
     }
 
-    let (sender, mut receiver) = mpsc::channel::<Command>(100);
-    let (executor_sender, mut executor_receiver) = mpsc::channel::<Command>(100);
+    let (executor_tx, mut executor_rx) = mpsc::channel::<ExecutorCommand>(100);
+    let (acker_tx, mut acker_rx) = mpsc::channel::<AckerCommand>(100);
 
-    // consumer is only responsible to iteract with the broker
-    // consuming messages or ack/nack messages
-    // fairness with select, concurrently
+    // consumer thread
     tokio::spawn(async move {
         let addr = "pulsar://127.0.0.1:6650";
-        // to do handle errors
-        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
 
-        let consumer: Consumer<TestData, _> = pulsar
+        let mut consumer: Consumer<TestData, _> = pulsar
             .consumer()
             .with_topic("test")
             .with_consumer_name("test_consumer")
@@ -101,36 +101,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .unwrap(); // to do handle errors
 
-        // consumer without mutex!
-        let mut consumer = consumer;
+        loop {
+            while let pulsar_msg = consumer.try_next().await {
+                match pulsar_msg {
+                    Ok(Some(pulsar_msg)) => executor_tx
+                        .send(ExecutorCommand::Process { msg: pulsar_msg })
+                        .await
+                        .expect("to send"),
+                    Ok(None) => {
+                        println!("nothing to poll");
+                    }
+                    Err(e) => {
+                        eprintln!("Error consuming message: {:?}, retrying later...", e);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // acker thread
+    tokio::spawn(async move {
+        let addr = "pulsar://127.0.0.1:6650";
+        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
+
+        let mut consumer: Consumer<TestData, _> = pulsar
+            .consumer()
+            .with_topic("test")
+            .with_consumer_name("test_consumer")
+            .with_subscription_type(SubType::KeyShared)
+            .with_subscription("test_subscription")
+            .with_unacked_message_resend_delay(Some(Duration::from_secs(60)))
+            .build()
+            .await
+            .unwrap(); // to do handle errors
 
         loop {
-            tokio::select! {
-              Some(msg) = receiver.recv() => {
-                match msg {
-                    Command::Ack{msg}=>{
-                      println!("acking msg: {:?}", msg.message_id);
-                      consumer.ack(&msg).await.expect("ack the message");
-                    },
-                    Command::Nack{msg}=>{
-                      println!("nacking");
-                      consumer.nack(&msg).await.expect("nack the message")
-                    },
-                    Command::Process { msg } => todo!(),
+            while let Some(cmd) = acker_rx.recv().await {
+                match cmd {
+                    AckerCommand::Ack { msg } => consumer.ack(&msg).await.expect("should ack"),
+                    AckerCommand::Nack { msg } => consumer.nack(&msg).await.expect("should nack"),
                 }
-              },
-              pulsar_msg = consumer.try_next() => {
-                match pulsar_msg {
-                  Ok(Some(pulsar_msg)) => {executor_sender.send(Command::Process { msg: pulsar_msg }).await.expect("to send") }
-                Ok(None) => {
-                    println!("nothing to poll");
-                }
-                Err(e) => {
-                    eprintln!("Error consuming message: {:?}, retrying later...", e);
-                    break;
-                }
-                        }
-              }
             }
         }
     });
@@ -141,15 +152,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_THREADS));
         // let mut tasks = FuturesUnordered::new();
 
-        while let Some(msg) = executor_receiver.recv().await {
+        while let Some(msg) = executor_rx.recv().await {
             println!("[EXECUTOR] reading msg");
 
-            let sender = sender.clone();
+            let sender = acker_tx.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
 
             tokio::spawn(async move {
                 match msg {
-                    Command::Process { msg } => {
+                    ExecutorCommand::Process { msg } => {
                         match msg.deserialize() {
                             Ok(data) => {
                                 println!(
@@ -171,13 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 sleep(Duration::from_millis(10));
 
                                 sender
-                                    .send(Command::Ack { msg })
+                                    .send(AckerCommand::Ack { msg })
                                     .await
                                     .expect("to send ack");
                             }
                             Err(e) => {
                                 sender
-                                    .send(Command::Nack { msg })
+                                    .send(AckerCommand::Nack { msg })
                                     .await
                                     .expect("to send nack");
                                 return Err(Box::<dyn Error + Send + Sync>::from(format!(
@@ -187,8 +198,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                     }
-                    Command::Ack { msg } => todo!(),
-                    Command::Nack { msg } => todo!(),
                 }
                 drop(permit);
                 Ok(())
