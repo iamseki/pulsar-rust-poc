@@ -20,7 +20,7 @@ async fn main() -> Result<(), pulsar::Error> {
 
     let mut v = Vec::new();
 
-    for i in 0..25000 {
+    for i in 0..2000 {
         let parition_key = if i % 2 == 0 {
             "10".to_string()
         } else {

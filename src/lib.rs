@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate serde;
 
+pub mod actors;
+
 use pulsar::{
     message::Payload,
     producer, DeserializeMessage, Error as PulsarError, SerializeMessage
@@ -15,6 +17,7 @@ pub struct TestData {
 impl SerializeMessage for TestData {
     fn serialize_message(input: Self) -> Result<producer::Message, PulsarError> {
         let payload = serde_json::to_vec(&input).map_err(|e| PulsarError::Custom(e.to_string()))?;
+
         Ok(producer::Message {
             payload,
             partition_key: Some(input.partition_key),
