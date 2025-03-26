@@ -1,26 +1,9 @@
-use std::{
-    error::Error,
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
-};
-
 //tokio-debug-console
 //use console_subscriber;
 
-use chrono::Local;
-use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
-use pulsar::{
-    consumer::Message, message::proto::command_subscribe::SubType, Consumer, Pulsar, TokioExecutor,
-};
-use pulsar_rust_poc::TestData;
-use tokio::{
-    process::Command,
-    runtime::Handle,
-    signal,
-    sync::{mpsc, Semaphore},
-    time::{sleep as sleep_tokio},
-};
+use pulsar::{Pulsar, TokioExecutor};
+use pulsar_rust_poc::actors;
+use tokio::{process::Command, runtime::Handle, signal};
 
 use sysinfo::System;
 
@@ -73,251 +56,35 @@ async fn print_system_info() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_system_info().await;
 
-    enum ExecutorCommand {
-        Process { msg: Message<TestData> },
-    }
+    let addr = "pulsar://127.0.0.1:6650";
+    let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
 
-    enum AckerCommand {
-        Ack { msg: Message<TestData> },
-        Nack { msg: Message<TestData> },
-    }
+    // init acker task
+    let acker_handle =
+        actors::AckerHandle::new(&pulsar, vec!["test".to_string(), "test-01".to_string()]).await;
 
-    // exclusive channel to process every ack/nack
-    let (acker_tx, mut acker_rx) = mpsc::channel::<AckerCommand>(100);
-    let acker_tx_tx_topic_test01 = acker_tx.clone();
+    let acker_tx_test = acker_handle.acker_tx.clone();
 
-    // ACKER THREAD
-    tokio::spawn(async move {
-        let addr = "pulsar://127.0.0.1:6650";
-        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
+    // actors to receive and process topic "test"
+    // init executor task
+    let executor_handle = actors::ExecutorHandle::new(acker_tx_test).await;
+    let executor_tx_test = executor_handle.executor_tx.clone();
 
-        let mut consumer: Consumer<TestData, _> = pulsar
-            .consumer()
-            .with_topic("test")
-            .with_topic("test-01")
-            .with_consumer_name("test_consumer_acker")
-            .with_subscription_type(SubType::KeyShared)
-            .with_subscription("test_subscription")
-            .build()
-            .await
-            .unwrap(); // to do handle errors
+    let mut receiver_topic_test =
+        actors::Receiver::new(&pulsar, "test".to_string(), executor_tx_test).await;
+    // since there is no channels initialized in the consumer actor, its unecessary to create a handle so just init receiver task
+    tokio::spawn(async move { receiver_topic_test.consume().await });
 
-        loop {
-            while let Some(cmd) = acker_rx.recv().await {
-                match cmd {
-                    AckerCommand::Ack { msg } => {
-                        println!("ACK TOPIC => {}, message_id => {:?}", &msg.topic, msg.message_id.id);
-                        consumer
-                        .ack_with_id(&msg.topic, msg.message_id.id)
-                        .await
-                        .expect("should ack");
-                    },
-                    AckerCommand::Nack { msg } => {
-                        println!("NACK TOPIC => {}, message_id => {:?}", &msg.topic, msg.message_id.id);
-                        consumer
-                        .nack_with_id(&msg.topic, msg.message_id.id)
-                        .await
-                        .expect("should nack")
-                    },
-                }
-            }
-        }
-    });
+    let acker_tx_test01 = acker_handle.acker_tx.clone();
+    // actors to receive and process topic "test-01"
+    // init executor task
+    let executor_handle_test01 = actors::ExecutorHandle::new(acker_tx_test01).await;
+    let executor_tx_test01 = executor_handle_test01.executor_tx.clone();
 
-    // exclusive channel to process topic test
-    let (executor_tx, mut executor_rx) = mpsc::channel::<ExecutorCommand>(100);
-
-    // CONSUMER TOPIC TEST
-    tokio::spawn(async move {
-        let addr = "pulsar://127.0.0.1:6650";
-        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
-
-        let mut consumer_test: Consumer<TestData, _> = pulsar
-            .consumer()
-            .with_topic("test")
-            .with_consumer_name("test_consumer")
-            .with_subscription_type(SubType::KeyShared)
-            .with_subscription("test_subscription")
-            .with_unacked_message_resend_delay(Some(Duration::from_secs(60)))
-            .build()
-            .await
-            .unwrap(); // to do handle errors
-
-        loop {
-            while let pulsar_msg = consumer_test.try_next().await {
-                match pulsar_msg {
-                    Ok(Some(pulsar_msg)) => executor_tx
-                        .send(ExecutorCommand::Process { msg: pulsar_msg })
-                        .await
-                        .expect("to send"),
-                    Ok(None) => {
-                        println!("nothing to poll");
-                    }
-                    Err(e) => {
-                        eprintln!("Error consuming message: {:?}, retrying later...", e);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // EXECUTOR THREAD TOPIC "TEST"
-    tokio::spawn(async move {
-        const MAX_CONCURRENT_THREADS: usize = 100;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_THREADS));
-        // let mut tasks = FuturesUnordered::new();
-
-        while let Some(msg) = executor_rx.recv().await {
-            println!("[EXECUTOR] reading msg");
-
-            let sender = acker_tx.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            tokio::spawn(async move {
-                match msg {
-                    ExecutorCommand::Process { msg } => {
-                        match msg.deserialize() {
-                            Ok(data) => {
-                                println!(
-                                    "[EXECUTOR] processing data: {:?}, timestamp: {:?}",
-                                    data,
-                                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-                                );
-
-                                // All the algorithm needs to do is:
-                                // 1. Fetch dependent Data (mostly I/O)
-                                // 2. Calculate Operations (CPU)
-                                // 3. Calculate KPIs (CPU)
-                                // 4. Write it into the database (mostly I/O)
-
-                                // Simulate some I/O work
-                                sleep_tokio(Duration::from_millis(100)).await;
-
-                                // Simulate some CPU work
-                                sleep(Duration::from_millis(10));
-
-                                sender
-                                    .send(AckerCommand::Ack { msg })
-                                    .await
-                                    .expect("to send ack");
-                            }
-                            Err(e) => {
-                                sender
-                                    .send(AckerCommand::Nack { msg })
-                                    .await
-                                    .expect("to send nack");
-                                return Err(Box::<dyn Error + Send + Sync>::from(format!(
-                                    "Deserialization failed: {}",
-                                    e
-                                )));
-                            }
-                        };
-                    }
-                }
-                drop(permit);
-                Ok(())
-            });
-        }
-    });
-
-    // exclusive channel to process topic "test-01"
-    let (executor_tx_test01, mut executor_rx_test01) = mpsc::channel::<ExecutorCommand>(100);
-
-    // CONSUMER TOPIC TEST-01
-    tokio::spawn(async move {
-        let addr = "pulsar://127.0.0.1:6650";
-        let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap(); // to do handle errors
-
-        let mut consumer_test01: Consumer<TestData, _> = pulsar
-            .consumer()
-            .with_topic("test-01")
-            .with_consumer_name("test_consumer_test01")
-            .with_subscription_type(SubType::KeyShared)
-            .with_subscription("test_subscription")
-            .with_unacked_message_resend_delay(Some(Duration::from_secs(60)))
-            .build()
-            .await
-            .unwrap(); // to do handle errors
-
-        loop {
-            while let pulsar_msg = consumer_test01.try_next().await {
-                match pulsar_msg {
-                    Ok(Some(pulsar_msg)) => executor_tx_test01
-                        .send(ExecutorCommand::Process { msg: pulsar_msg })
-                        .await
-                        .expect("to send"),
-                    Ok(None) => {
-                        println!("nothing to poll");
-                    }
-                    Err(e) => {
-                        eprintln!("Error consuming message: {:?}, retrying later...", e);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // EXECUTOR THREAD TOPIC "TEST-01"
-    tokio::spawn(async move {
-        const MAX_CONCURRENT_THREADS: usize = 100;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_THREADS));
-        // let mut tasks = FuturesUnordered::new();
-
-        while let Some(msg) = executor_rx_test01.recv().await {
-            println!("[EXECUTOR] reading msg");
-
-            let sender = acker_tx_tx_topic_test01.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            tokio::spawn(async move {
-                match msg {
-                    ExecutorCommand::Process { msg } => {
-                        match msg.deserialize() {
-                            Ok(data) => {
-                                println!(
-                                    "[EXECUTOR] processing data: {:?}, timestamp: {:?}",
-                                    data,
-                                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-                                );
-
-                                // All the algorithm needs to do is:
-                                // 1. Fetch dependent Data (mostly I/O)
-                                // 2. Calculate Operations (CPU)
-                                // 3. Calculate KPIs (CPU)
-                                // 4. Write it into the database (mostly I/O)
-
-                                // Simulate some I/O work
-                                sleep_tokio(Duration::from_millis(100)).await;
-
-                                // Simulate some CPU work
-                                sleep(Duration::from_millis(10));
-
-                                sender
-                                    .send(AckerCommand::Ack { msg })
-                                    .await
-                                    .expect("to send ack");
-                            }
-                            Err(e) => {
-                                sender
-                                    .send(AckerCommand::Nack { msg })
-                                    .await
-                                    .expect("to send nack");
-                                return Err(Box::<dyn Error + Send + Sync>::from(format!(
-                                    "Deserialization failed: {}",
-                                    e
-                                )));
-                            }
-                        };
-                    }
-                }
-                drop(permit);
-                Ok(())
-            });
-        }
-    });
-
+    let mut receiver_topic_test01 =
+        actors::Receiver::new(&pulsar, "test-01".to_string(), executor_tx_test01).await;
+    // since there is no channels initialized in the consumer actor, its unecessary to create a handle so just init receiver task
+    tokio::spawn(async move { receiver_topic_test01.consume().await });
 
     match signal::ctrl_c().await {
         Ok(()) => {
